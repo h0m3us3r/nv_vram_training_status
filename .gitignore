@@ -1,0 +1,12 @@
+# compiled binaries
+/nv_vram_training_status
+
+# object files / build artifacts
+*.o
+*.out
+*.d
+
+# editor / OS cruft
+*~
+.*.swp
+.DS_Store
