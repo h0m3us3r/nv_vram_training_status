@@ -63,8 +63,39 @@
 // hardware reference. Validate against a card with a known-bad IC before
 // trusting a FAIL verdict for a repair decision (see --raw).
 //
+// Error counts (--errors)
+// -----------------------
+//   Each partition also exposes free-running per-subpartition error counters at
+//   FBPA offset 0x480..0x48c (four 32-bit words). These are read read-only and
+//   accumulate detected/corrected data-bus (EDC/ECC) errors. A partition that
+//   trained cleanly but is steadily logging errors points to a *marginal* IC —
+//   one that is intermittent, or only fails under load or temperature — which a
+//   pass/fail training verdict alone will not catch. Reading them writes nothing,
+//   so --errors keeps the same read-only safety as the default mode. The four
+//   words pair up by subpartition — subp0 = 0x480+0x484, subp1 = 0x488+0x48c,
+//   matching the controller's own per-subpartition counter-select grouping; the
+//   two words in a pair are the subpartition's byte-lanes (see --raw).
+//
+// Forced retrain (--retrain)   [THE ONLY MODE THAT WRITES TO THE GPU]
+// -------------------------------------------------------------------
+//   --retrain asks the memory controller to re-run DQ training by asserting the
+//   request bit (0x80000000) in the two broadcast training-command registers
+//   (FBPA 0x910 / 0x914), waits for the per-subpartition status to settle, then
+//   prints the fresh result. Use it to tell an intermittent fault from a hard
+//   one, or to re-validate after a reflow/reball/IC swap without a full reboot.
+//
+//   This is the only path that writes to the GPU; it needs R/W BAR access
+//   (the BAR is opened O_RDWR only in this mode) and an explicit confirmation
+//   (or --yes). It is UNSAFE on a card whose framebuffer is in active use —
+//   re-training the live memory link can freeze the display or hang the
+//   machine. Run it on a bench card driven from a second GPU / serial console.
+//   The trigger writes only the request bit on top of the controller's existing
+//   command words (a minimal kick, not a full vendor training sequence) and the
+//   offsets are not from a published reference: treat this mode as experimental.
+//
 // Build:  cc -O2 -o nv_vram_training_status nv_vram_training_status.c
-// Run:    sudo ./nv_vram_training_status [--raw] [--color]
+// Run:    sudo ./nv_vram_training_status [--raw] [--color] [--errors]
+//         sudo ./nv_vram_training_status --retrain [--yes]   (writes to the GPU)
 //
 // If the BAR mmap fails (EPERM via /dev/mem, or EINVAL via the sysfs resource),
 // the kernel's CONFIG_IO_STRICT_DEVMEM is refusing access to the driver-owned
@@ -84,6 +115,11 @@
 #define FBPA_BASE     0x900000u    // FBPA (memory-controller) register block
 #define FBPA_STRIDE   0x4000u      // per memory partition
 #define TRAIN_OFF     0x0974u      // NV_PFB_FBPA_TRAINING_STATUS (per partition)
+#define ECC_OFF       0x0480u      // per-partition error counters: 4 words at 0x480..0x48c
+#define ECC_NREG      4
+#define TRAIN_CMD0    0x9a0910u    // broadcast (all-partition) training-command registers
+#define TRAIN_CMD1    0x9a0914u
+#define TRAIN_CMD_GO  0x80000000u  // request bit: asserting it kicks a training run
 #define NUM_FBPA      24           // scan up to 24; non-existent ones are skipped
 #define NUM_SUBP      2            // subpartitions per partition
 #define MAP_LEN       0x1000000u   // map enough of BAR0 to cover the FBPA block
@@ -211,6 +247,63 @@ static void print_state(unsigned v, int color) {
     else       printf("%-9s", state_name(v));
 }
 
+// A partition that does not exist on this board reads the PRI "bad read"
+// sentinel 0xBADF____ (or all-ones) in its training-status word.
+static int part_present(volatile uint8_t *map, int part) {
+    uint32_t off = FBPA_BASE + (uint32_t)part * FBPA_STRIDE + TRAIN_OFF;
+    uint32_t reg = *(volatile uint32_t *)(map + off);
+    return !((reg >> 16) == 0xbadf || reg == 0xffffffff);
+}
+
+// Read-only per-partition error-count report. Returns the number of partitions
+// with a nonzero count (a marginal-IC indicator even when training passed).
+static int report_errors(volatile uint8_t *map, int color, int raw) {
+    printf("  FBPA  subp0-errs  subp1-errs%s\n", raw ? "  raw 480..48c" : "");
+    printf("  ----  ----------  ----------%s\n", raw ? "  ------------" : "");
+    int populated = 0, flagged = 0;
+    for (int part = 0; part < NUM_FBPA; part++) {
+        if (!part_present(map, part)) continue;
+        populated++;
+        uint32_t pbase = FBPA_BASE + (uint32_t)part * FBPA_STRIDE;
+        uint32_t c[ECC_NREG];
+        for (int i = 0; i < ECC_NREG; i++)
+            c[i] = *(volatile uint32_t *)(map + pbase + ECC_OFF + (uint32_t)i * 4u);
+        uint64_t s0 = (uint64_t)c[0] + c[1];
+        uint64_t s1 = (uint64_t)c[2] + c[3];
+        const char *r0 = (color && s0) ? "\033[1;31m" : "";
+        const char *r1 = (color && s1) ? "\033[1;31m" : "";
+        printf("  %4d  %s%10llu%s  %s%10llu%s", part,
+               r0, (unsigned long long)s0, *r0 ? C_RESET : "",
+               r1, (unsigned long long)s1, *r1 ? C_RESET : "");
+        if (raw) printf("  %08x %08x %08x %08x", c[0], c[1], c[2], c[3]);
+        printf("\n");
+        if (s0 || s1) flagged++;
+    }
+    return populated ? flagged : -1;
+}
+
+// EXPERIMENTAL, WRITES TO THE GPU. Asserts the request bit in the broadcast
+// training-command registers to re-run DQ training, then waits (up to ~2s) for
+// every present subpartition to leave the "in progress" state.
+static void do_retrain(volatile uint8_t *map) {
+    uint32_t c0 = *(volatile uint32_t *)(map + TRAIN_CMD0);
+    uint32_t c1 = *(volatile uint32_t *)(map + TRAIN_CMD1);
+    *(volatile uint32_t *)(map + TRAIN_CMD0) = c0 | TRAIN_CMD_GO;
+    *(volatile uint32_t *)(map + TRAIN_CMD1) = c1 | TRAIN_CMD_GO;
+
+    for (int t = 0; t < 200; t++) {
+        usleep(10000);                 // 10 ms
+        int busy = 0;
+        for (int part = 0; part < NUM_FBPA; part++) {
+            if (!part_present(map, part)) continue;
+            uint32_t off = FBPA_BASE + (uint32_t)part * FBPA_STRIDE + TRAIN_OFF;
+            uint32_t r = *(volatile uint32_t *)(map + off);
+            if ((r & 3) == ST_IN_PROGRESS || ((r >> 2) & 3) == ST_IN_PROGRESS) busy = 1;
+        }
+        if (!busy) return;
+    }
+}
+
 // Find the first NVIDIA GPU via sysfs: fills res0_path, pci_id, dev_id, bar0_len;
 // returns the BAR0 physical base (0 on failure).
 static uint64_t find_gpu(char *res0_path, size_t res0_sz, char *pci_id, size_t pci_sz,
@@ -254,21 +347,30 @@ static uint64_t find_gpu(char *res0_path, size_t res0_sz, char *pci_id, size_t p
 }
 
 int main(int argc, char **argv) {
-    int color = 0, raw = 0;
+    int color = 0, raw = 0, errors = 0, retrain = 0, assume_yes = 0;
     for (int a = 1; a < argc; a++) {
         if (!strcmp(argv[a], "-c") || !strcmp(argv[a], "--color")) color = 1;
         else if (!strcmp(argv[a], "-r") || !strcmp(argv[a], "--raw")) raw = 1;
+        else if (!strcmp(argv[a], "-e") || !strcmp(argv[a], "--errors")) errors = 1;
+        else if (!strcmp(argv[a], "--retrain")) retrain = 1;
+        else if (!strcmp(argv[a], "-y") || !strcmp(argv[a], "--yes")) assume_yes = 1;
         else if (!strcmp(argv[a], "-h") || !strcmp(argv[a], "--help")) {
-            printf("usage: %s [--raw] [--color]\n"
+            printf("usage: %s [--raw] [--color] [--errors]\n"
+                   "       %s --retrain [--yes] [--color]\n"
                    "  Reports NVIDIA VRAM per-subpartition DQ-training status (read-only).\n"
                    "  Works on Pascal/Turing/Ampere/Ada (GTX 10xx/16xx, RTX 20/30/40). HBM unsupported.\n"
-                   "  --raw,   -r   also print the raw status word per partition\n"
-                   "  --color, -c   green = ok, red = failed\n"
+                   "  --raw,     -r   also print the raw register word(s) per partition\n"
+                   "  --color,   -c   green = ok, red = failed\n"
+                   "  --errors,  -e   also report per-subpartition error counts (read-only)\n"
+                   "  --retrain       re-run DQ training first, then report  [WRITES TO THE GPU]\n"
+                   "  --yes,     -y   skip the --retrain confirmation prompt\n"
                    "  exit: 0 all trained, 3 a subpartition failed, 1 cannot read, 2 unsupported\n",
-                   argv[0]);
+                   argv[0], argv[0]);
             return 0;
         } else { fprintf(stderr, "unknown argument: %s (try --help)\n", argv[a]); return 2; }
     }
+    if (assume_yes && !retrain)
+        fprintf(stderr, "note: --yes only applies to --retrain; ignoring.\n");
 
     char res0_path[512], pci_id[64] = "";
     uint16_t dev_id = 0;
@@ -282,9 +384,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    int fd = open(res0_path, O_RDONLY);
+    int fd = open(res0_path, retrain ? O_RDWR : O_RDONLY);
     if (fd < 0) { perror("open resource0 (run as root)"); return 1; }
-    volatile uint8_t *map = mmap(NULL, MAP_LEN, PROT_READ, MAP_SHARED, fd, 0);
+    int prot = retrain ? (PROT_READ | PROT_WRITE) : PROT_READ;
+    volatile uint8_t *map = mmap(NULL, MAP_LEN, prot, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         perror("mmap resource0");
         fprintf(stderr, "EPERM  => kernel lockdown (Secure Boot): disable it.\n"
@@ -320,6 +423,24 @@ int main(int argc, char **argv) {
             fprintf(stderr,
                 "Note: %s is newer than Ada and untested; assuming the same register layout.\n\n",
                 arch_name(chip_id));
+    }
+
+    if (retrain) {
+        if (!assume_yes) {
+            fprintf(stderr,
+                "WARNING: --retrain WRITES to the GPU and re-runs the live memory\n"
+                "training. On a card whose framebuffer is in use this can freeze the\n"
+                "display or hang the machine. Only proceed on a bench/secondary GPU.\n"
+                "Type 'yes' to continue: ");
+            char line[16] = {0};
+            if (!fgets(line, sizeof line, stdin) || strncmp(line, "yes", 3) != 0) {
+                fprintf(stderr, "Aborted.\n");
+                munmap((void *)map, MAP_LEN); close(fd); return 1;
+            }
+        }
+        printf("Re-running DQ training...\n");
+        do_retrain(map);
+        printf("\n");
     }
 
     printf("  FBPA  subp0      subp1%s\n", raw ? "        raw" : "");
@@ -362,6 +483,16 @@ int main(int argc, char **argv) {
                populated, failures);
         for (int i = 0; i < failures; i++)
             printf("    FBPA %d, subpartition %d\n", fail_fbpa[i], fail_subp[i]);
+    }
+
+    if (errors) {
+        printf("\nError counts (read-only):\n");
+        int flagged = report_errors(map, color, raw);
+        if (flagged > 0)
+            printf("\n%d partition(s) report nonzero errors — suspect a marginal IC there\n"
+                   "even where DQ training passed.\n", flagged);
+        else if (flagged == 0)
+            printf("\nAll present partitions report zero accumulated errors.\n");
     }
 
     munmap((void *)map, MAP_LEN);
